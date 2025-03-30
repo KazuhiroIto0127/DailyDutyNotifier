@@ -1,8 +1,12 @@
 {
-  "name": "slack-bot",
+  "name": "simple-slack-notifier",
   "version": "1.0.0",
-  "description": "A simple Slack bot using Node.js",
+  "description": "",
   "main": "index.js",
+  "type": "module",
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
   "scripts": {
     "zip": "zip -r function.zip . -x \"*.DS_Store\""
   },
