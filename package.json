@@ -1,0 +1,12 @@
+{
+  "name": "slack-bot",
+  "version": "1.0.0",
+  "description": "A simple Slack bot using Node.js",
+  "main": "index.js",
+  "scripts": {
+    "zip": "zip -r function.zip . -x \"*.DS_Store\""
+  },
+  "dependencies": {
+    "@slack/web-api": "^7.9.1"
+  }
+}
