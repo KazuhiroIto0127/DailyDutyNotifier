@@ -11,6 +11,8 @@
     "zip": "zip -r function.zip . -x \"*.DS_Store\""
   },
   "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.777.0",
+    "@aws-sdk/lib-dynamodb": "^3.778.0",
     "@slack/web-api": "^7.9.1"
   }
 }
