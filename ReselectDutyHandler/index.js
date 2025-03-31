@@ -191,8 +191,49 @@ const updateDynamoDBForReselection = async (originalMemberId, newMember) => {
   }
 };
 
+// --- ヘルパー関数: メンバーリスト表示用ブロック作成 ---
+const createMemberListBlocks = (members) => {
+  if (!members || members.length === 0) {
+    return []; // メンバーデータがない場合は空配列
+  }
+
+  // 見やすいように名前順でソート (任意)
+  members.sort((a, b) => (a.memberName || a.memberId || '').localeCompare(b.memberName || b.memberId || ''));
+
+  let memberListText = "*現在の担当回数:*\n";
+  members.forEach(member => {
+    // Slackでメンション形式(<@Uxxxx>)にしたい場合は memberId を使う
+    // const name = member.memberId.startsWith('U') || member.memberId.startsWith('W') ? `<@${member.memberId}>` : (member.memberName || member.memberId);
+    const name = member.memberName || member.memberId; // 通常は名前を表示
+    const count = member.dutyCount || 0;
+    memberListText += `• ${name}: ${count}回\n`;
+  });
+
+  // context ブロックを使うと少しコンパクトに表示される
+  return [
+    { type: 'divider' }, // 区切り線
+    {
+      type: 'context',
+      elements: [
+        {
+          type: 'mrkdwn',
+          text: memberListText
+        }
+      ]
+    }
+    // または Section ブロックで表示する場合:
+    // {
+    //     type: 'section',
+    //     text: {
+    //         type: 'mrkdwn',
+    //         text: memberListText
+    //     }
+    // }
+  ];
+};
+
 // ★ 元のSlackメッセージを更新する関数
-const updateSlackMessage = async (channelId, messageTs, newMember, originalMemberId, reselectorUserId) => { // ★ originalMemberId も受け取る
+const updateSlackMessage = async (channelId, messageTs, newMember, originalMemberId, reselectorUserId, members) => { // ★ originalMemberId も受け取る
   const newMemberId = newMember.memberId;
   const newMemberMention = newMemberId.startsWith('U') || newMemberId.startsWith('W') ? `<@${newMemberId}>` : (newMember.memberName || newMemberId);
   const originalMemberMention = originalMemberId.startsWith('U') || originalMemberId.startsWith('W') ? `<@${originalMemberId}>` : originalMemberId; // 元の担当者も表示（任意）
@@ -200,6 +241,8 @@ const updateSlackMessage = async (channelId, messageTs, newMember, originalMembe
 
   // メッセージ本文を更新
   const text = `🔄 ${reselectorMention} さんが担当者を変更しました。\n新しい担当は ${newMemberMention} さんです！ (元の担当: ${originalMemberMention})`;
+  // ★ メンバーリスト表示用のブロックを作成
+  const memberListBlocks = createMemberListBlocks(members);
 
   try {
     await slackClient.chat.update({
@@ -237,7 +280,9 @@ const updateSlackMessage = async (channelId, messageTs, newMember, originalMembe
               "value": JSON.stringify({ current_member_id: newMemberId })
             }
           ]
-        }
+        },
+        // ★★★ 作成したメンバーリストブロックを追加 ★★★
+        ...memberListBlocks
       ]
     });
     logger.info(`Updated Slack message ${messageTs} with new duty member ${newMemberId}, keeping the button.`);
@@ -339,8 +384,11 @@ export const handler = async (event, context) => {
     // --- 6. DynamoDBのデータを更新 ---
     await updateDynamoDBForReselection(currentMemberId, newMember);
 
+    // ★★★ Slack更新前に最新のメンバー情報を再取得 ★★★
+    const updatedMembers = await getAllMembers();
+
     // --- 7. 元のSlackメッセージを更新 ---
-    await updateSlackMessage(channelId, messageTs, newMember, currentMemberId, userId);
+    await updateSlackMessage(channelId, messageTs, newMember, currentMemberId, userId, updatedMembers);
 
 
     // --- 8. 正常終了のACK応答 ---
