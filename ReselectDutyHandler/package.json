@@ -1,0 +1,21 @@
+{
+  "name": "reselect-duty-handler",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "type": "module",
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "scripts": {
+    "run": "node index.js",
+    "zip": "zip -r function.zip . -x \"*.DS_Store\""
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.777.0",
+    "@aws-sdk/lib-dynamodb": "^3.778.0",
+    "@slack/events-api": "^3.0.1",
+    "@slack/web-api": "^7.9.1",
+    "querystring": "^0.2.1"
+  }
+}
