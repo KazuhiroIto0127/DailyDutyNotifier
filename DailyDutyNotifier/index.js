@@ -138,13 +138,55 @@ const updateDutyData = async (selectedMember, todayStr) => {
   }
 };
 
+// --- ヘルパー関数: メンバーリスト表示用ブロック作成 ---
+const createMemberListBlocks = (members) => {
+  if (!members || members.length === 0) {
+    return []; // メンバーデータがない場合は空配列
+  }
+
+  // 見やすいように名前順でソート (任意)
+  members.sort((a, b) => (a.memberName || a.memberId || '').localeCompare(b.memberName || b.memberId || ''));
+
+  let memberListText = "*現在の担当回数:*\n";
+  members.forEach(member => {
+    // Slackでメンション形式(<@Uxxxx>)にしたい場合は memberId を使う
+    // const name = member.memberId.startsWith('U') || member.memberId.startsWith('W') ? `<@${member.memberId}>` : (member.memberName || member.memberId);
+    const name = member.memberName || member.memberId; // 通常は名前を表示
+    const count = member.dutyCount || 0;
+    memberListText += `• ${name}: ${count}回\n`;
+  });
+
+  // context ブロックを使うと少しコンパクトに表示される
+  return [
+    { type: 'divider' }, // 区切り線
+    {
+      type: 'context',
+      elements: [
+        {
+          type: 'mrkdwn',
+          text: memberListText
+        }
+      ]
+    }
+    // または Section ブロックで表示する場合:
+    // {
+    //     type: 'section',
+    //     text: {
+    //         type: 'mrkdwn',
+    //         text: memberListText
+    //     }
+    // }
+  ];
+};
+
 // Slackに日直通知を送信 (ボタン付き)
-const sendSlackNotification = async (member, dateStr) => {
+const sendSlackNotification = async (member, dateStr, members) => {
   const memberId = member.memberId;
   // Slackのメンション形式 <@MEMBER_ID> を使うと通知が飛ぶ
   const mention = memberId.startsWith('U') || memberId.startsWith('W') ? `<@${memberId}>` : (member.memberName || memberId);
   const message = `☀️ 今日 (${dateStr}) の日直は ${mention} さんです！\nよろしくお願いします！`; // ★ 引数の dateStr をそのまま使う
-
+  // ★ メンバーリスト表示用のブロックを作成
+  const memberListBlocks = createMemberListBlocks(members);
   try {
     const response = await slackClient.chat.postMessage({
       channel: slackChannelId,
@@ -175,7 +217,9 @@ const sendSlackNotification = async (member, dateStr) => {
               "value": JSON.stringify({ current_member_id: memberId })
             }
           ]
-        }
+        },
+        // ★★★ 作成したメンバーリストブロックを追加 ★★★
+        ...memberListBlocks // スプレッド構文で配列を展開して追加
       ]
     });
     logger.info(`Slack notification sent successfully: ${response.ts}`);
@@ -231,8 +275,11 @@ export const handler = async (event, context) => {
     // --- 4. DynamoDBのデータを更新 ---
     await updateDutyData(selectedMember, todayStr);
 
+    // ★★★ Slack通知前に最新のメンバー情報を再取得 ★★★
+    const updatedMembers = await getAllMembers();
+
     // --- 5. Slackに通知 ---
-    await sendSlackNotification(selectedMember, todayStr);
+    await sendSlackNotification(selectedMember, todayStr, updatedMembers);
 
     return {
       statusCode: 200,
