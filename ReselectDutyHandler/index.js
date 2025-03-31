@@ -192,41 +192,58 @@ const updateDynamoDBForReselection = async (originalMemberId, newMember) => {
 };
 
 // ★ 元のSlackメッセージを更新する関数
-const updateSlackMessage = async (channelId, messageTs, newMember, reselectorUserId) => {
+const updateSlackMessage = async (channelId, messageTs, newMember, originalMemberId, reselectorUserId) => { // ★ originalMemberId も受け取る
   const newMemberId = newMember.memberId;
-  const mention = newMemberId.startsWith('U') || newMemberId.startsWith('W') ? `<@${newMemberId}>` : (newMember.memberName || newMemberId);
-  const reselectorMention = reselectorUserId ? `<@${reselectorUserId}>` : "誰か"; // ボタン押した人
+  const newMemberMention = newMemberId.startsWith('U') || newMemberId.startsWith('W') ? `<@${newMemberId}>` : (newMember.memberName || newMemberId);
+  const originalMemberMention = originalMemberId.startsWith('U') || originalMemberId.startsWith('W') ? `<@${originalMemberId}>` : originalMemberId; // 元の担当者も表示（任意）
+  const reselectorMention = reselectorUserId ? `<@${reselectorUserId}>` : "誰か";
 
-  const text = `🔄 ${reselectorMention} さんのリクエストにより、日直担当者が変更されました。\n新しい担当は ${mention} さんです！`;
+  // メッセージ本文を更新
+  const text = `🔄 ${reselectorMention} さんが担当者を変更しました。\n新しい担当は ${newMemberMention} さんです！ (元の担当: ${originalMemberMention})`;
 
   try {
     await slackClient.chat.update({
       channel: channelId,
-      ts: messageTs, // 更新対象のメッセージのタイムスタンプ
-      text: text,
-      blocks: [ // ボタンを削除し、更新後のメッセージを表示
+      ts: messageTs,
+      text: text, // フォールバックテキストも更新
+      blocks: [
         {
           "type": "section",
           "text": {
             "type": "mrkdwn",
-            "text": text
+            "text": text // 更新されたメッセージ本文
           }
         },
-        // { // 変更履歴を残す場合（任意）
+        // { // コンテキスト情報として元の担当者などを表示しても良い (任意)
         //     "type": "context",
         //     "elements": [
-        //         {
-        //             "type": "mrkdwn",
-        //             "text": `(元の担当者: <@${originalMemberId}>)` // originalMemberIdを渡す必要あり
-        //         }
+        //         { "type": "mrkdwn", "text": `元の担当: ${originalMemberMention}` }
         //     ]
-        // }
+        // },
+        { // ★ ボタンを含む actions ブロックを再度追加 (ボタンは消さない)
+          "type": "actions",
+          "block_id": "duty_actions", // 同じ block_id
+          "elements": [
+            {
+              "type": "button",
+              "text": {
+                "type": "plain_text",
+                "text": "担当を変更する", // ボタンのテキストは同じ
+                "emoji": true
+              },
+              "style": "danger",
+              "action_id": "reselect_duty_action", // 同じ action_id
+              // ★★★ 重要: value には *新しい* 担当者のIDを入れる ★★★
+              "value": JSON.stringify({ current_member_id: newMemberId })
+            }
+          ]
+        }
       ]
     });
-    logger.info(`Updated Slack message: ${messageTs}`);
+    logger.info(`Updated Slack message ${messageTs} with new duty member ${newMemberId}, keeping the button.`);
   } catch (error) {
     logger.error(`Error updating Slack message ${messageTs}: ${error.data?.error || error.message}`);
-    // ここでエラーになってもDynamoDB更新は完了している可能性
+    // エラー処理はそのまま
   }
 };
 
@@ -303,7 +320,14 @@ export const handler = async (event, context) => {
     }
 
     // --- 5. 新しい日直を選出 ---
-    const lastAssignedId = dutyState.lastAssignedMemberId; // 前回の担当者ID
+    const lastAssignedId = dutyState.lastAssignedMemberId;  // ★ 前回の最終担当者
+    // ★★★ selectNewDutyMember に渡す lastAssignedId は、DutyStateから取得した、
+    // ★★★ その日の最初の担当者（または前回ボタンで変更された担当者）のはず。
+    // ★★★ ボタンのValueには「現在表示されている担当者」が入る。
+    // ★★★ 混乱を避けるため、DutyState の lastAssignedMemberId を「前日の最終担当者」ではなく、
+    // ★★★ 「その日の現在(最新)の担当者」として扱うように updateDynamoDBForReselection を修正する。
+    // ★★★ -> いや、やはり現状のままでOK。「前回担当者」は DutyState.lastAssignedMemberId で、
+    // ★★★ 「現在の表示担当者」は buttonValue.current_member_id で区別できる。
     const newMember = selectNewDutyMember(allMembers, currentMemberId, lastAssignedId);
 
     if (!newMember) {
@@ -316,7 +340,8 @@ export const handler = async (event, context) => {
     await updateDynamoDBForReselection(currentMemberId, newMember);
 
     // --- 7. 元のSlackメッセージを更新 ---
-    await updateSlackMessage(channelId, messageTs, newMember, userId);
+    await updateSlackMessage(channelId, messageTs, newMember, currentMemberId, userId);
+
 
     // --- 8. 正常終了のACK応答 ---
     logger.info("Reselection process completed successfully.");
