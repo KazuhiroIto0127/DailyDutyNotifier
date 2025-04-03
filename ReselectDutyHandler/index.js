@@ -181,44 +181,33 @@ const updateDynamoDBForReselection = async (originalMemberId, newMember) => {
   }
 };
 
-// --- ヘルパー関数: メンバーリスト表示用ブロック作成 ---
+// ★ メンバーリスト表示用ブロック作成 (displayOrder でソート)
 const createMemberListBlocks = (members) => {
-  if (!members || members.length === 0) {
-    return []; // メンバーデータがない場合は空配列
-  }
+  if (!members || members.length === 0) return [];
 
-  // 見やすいように名前順でソート (任意)
-  members.sort((a, b) => (a.memberName || a.memberId || '').localeCompare(b.memberName || b.memberId || ''));
+  // ★★★ displayOrder でソート ★★★
+  members.sort((a, b) => {
+    const orderA = a.displayOrder ?? Infinity;
+    const orderB = b.displayOrder ?? Infinity;
+    if (orderA !== orderB) {
+      return orderA - orderB;
+    }
+    return (a.memberId || '').localeCompare(b.memberId || ''); // displayOrder が同じ場合の予備ソート
+  });
 
-  let memberListText = "*現在の担当回数:*\n";
+  let memberListText = "*現在の担当回数 (表示順):*\n"; // タイトル変更
   members.forEach(member => {
-    // Slackでメンション形式(<@Uxxxx>)にしたい場合は memberId を使う
-    // const name = member.memberId.startsWith('U') || member.memberId.startsWith('W') ? `<@${member.memberId}>` : (member.memberName || member.memberId);
-    const name = member.memberName || member.memberId; // 通常は名前を表示
+    const name = member.memberName || member.memberId;
     const count = member.dutyCount || 0;
     memberListText += `• ${name}: ${count}回\n`;
   });
 
-  // context ブロックを使うと少しコンパクトに表示される
   return [
-    { type: 'divider' }, // 区切り線
+    { type: 'divider' },
     {
       type: 'context',
-      elements: [
-        {
-          type: 'mrkdwn',
-          text: memberListText
-        }
-      ]
+      elements: [{ type: 'mrkdwn', text: memberListText }]
     }
-    // または Section ブロックで表示する場合:
-    // {
-    //     type: 'section',
-    //     text: {
-    //         type: 'mrkdwn',
-    //         text: memberListText
-    //     }
-    // }
   ];
 };
 
