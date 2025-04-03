@@ -105,42 +105,32 @@ const verifySlackRequest = (event) => {
   }
 };
 
-// ★ 新しい日直を選出するロジック (現在の担当者と前回担当者を除外)
-const selectNewDutyMember = (members, currentMemberId, lastAssignedId) => {
-  if (!members || members.length === 0) {
-    logger.error("Member list is empty.");
-    return null;
-  }
-  // 除外するIDのセットを作成
-  const excludeIds = new Set([currentMemberId, lastAssignedId]);
-  logger.info(`Excluding IDs: ${Array.from(excludeIds).join(', ')}`);
-
-  let candidates = members.filter(m => !excludeIds.has(m.memberId));
-
-  if (candidates.length === 0) {
-    logger.warn("No candidates after excluding current and last assigned. Trying excluding only current.");
-    candidates = members.filter(m => m.memberId !== currentMemberId);
-    if (candidates.length === 0) {
-      logger.warn("No candidates even after excluding only current. Selecting from all members (could result in the same member).");
-      candidates = [...members]; // 最悪全員から選ぶ（同じ人が再度選ばれる可能性も）
-    }
-  }
-  if (candidates.length === 0) { // 全員除外されてしまった場合（ありえないはずだが）
-    logger.error("Cannot select new member, no candidates available at all.");
-    return null;
+// ★ 選出ロジックを「メンバーID順ローテーション」に変更 ★
+const selectNextMemberByIdRotation = (members, currentMemberId) => {
+  if (!members || members.length <= 1) {
+    logger.warn("Cannot select next member by ID rotation: Not enough members.");
+    return members.length === 1 ? members[0] : null;
   }
 
-
-  // dutyCount昇順 -> memberId昇順でソート (notifyDutyHandlerと同様)
-  candidates.sort((a, b) => {
-    if (a.dutyCount !== b.dutyCount) {
-      return a.dutyCount - b.dutyCount;
-    }
+  // 1. ★★★ メンバーIDのみでソート (これが固定ローテーション順) ★★★
+  const sortedMembers = [...members].sort((a, b) => {
     return (a.memberId || '').localeCompare(b.memberId || '');
   });
+  logger.info(`[selectNextById] Sorted members by ID: ${sortedMembers.map(m => m.memberId).join(', ')}`);
 
-  const newMember = candidates[0];
-  logger.info(`New member selected: ${newMember.memberId} (Count: ${newMember.dutyCount})`);
+  // 2. ソート済みリスト内で、現在の担当者のインデックスを見つける
+  const currentIndex = sortedMembers.findIndex(m => m.memberId === currentMemberId);
+  logger.info(`[selectNextById] Current member ${currentMemberId} found at index: ${currentIndex}`);
+
+  if (currentIndex === -1) {
+    logger.error(`[selectNextById] Current member ${currentMemberId} not found in sorted list. Selecting the first member.`);
+    return sortedMembers[0];
+  }
+
+  // 3. 次のインデックスを計算 (リストの末尾なら先頭に戻る)
+  const nextIndex = (currentIndex + 1) % sortedMembers.length;
+  const newMember = sortedMembers[nextIndex];
+  logger.info(`[selectNextById] Next member selected based on ID rotation: ${newMember.memberId} (Index: ${nextIndex})`);
   return newMember;
 };
 
@@ -351,11 +341,9 @@ export const handler = async (event, context) => {
     // Slackは3秒以内にACK応答を期待するため、重い処理は非同期化推奨だが、
     // 今回は同期的に処理してみる
 
-    // --- 4. DynamoDBからデータを取得 ---
-    const [dutyState, allMembers] = await Promise.all([
-      getDutyState(),
-      getAllMembers()
-    ]);
+    // --- 再選出処理 ---
+    // ★★★ getAllMembers のみ呼び出す ★★★
+    const allMembers = await getAllMembers();
 
     if (allMembers.length === 0) {
       logger.error("No members found in DynamoDB.");
@@ -365,21 +353,21 @@ export const handler = async (event, context) => {
     }
 
     // --- 5. 新しい日直を選出 ---
-    const lastAssignedId = dutyState.lastAssignedMemberId;  // ★ 前回の最終担当者
-    // ★★★ selectNewDutyMember に渡す lastAssignedId は、DutyStateから取得した、
-    // ★★★ その日の最初の担当者（または前回ボタンで変更された担当者）のはず。
-    // ★★★ ボタンのValueには「現在表示されている担当者」が入る。
-    // ★★★ 混乱を避けるため、DutyState の lastAssignedMemberId を「前日の最終担当者」ではなく、
-    // ★★★ 「その日の現在(最新)の担当者」として扱うように updateDynamoDBForReselection を修正する。
-    // ★★★ -> いや、やはり現状のままでOK。「前回担当者」は DutyState.lastAssignedMemberId で、
-    // ★★★ 「現在の表示担当者」は buttonValue.current_member_id で区別できる。
-    const newMember = selectNewDutyMember(allMembers, currentMemberId, lastAssignedId);
+    const newMember = selectNextMemberByIdRotation(allMembers, currentMemberId);
 
     if (!newMember) {
       logger.error("Failed to select a new member (no candidates?).");
       await slackClient.chat.update({ channel: channelId, ts: messageTs, text: "エラー: 代わりの担当者を選出できませんでした。", blocks: [] });
       return { statusCode: 200, body: 'OK (Reselection failed)' };
     }
+    // ★ もし newMember が currentMemberId と同じになってしまった場合のガード (メンバー1人の場合など)
+    if (newMember.memberId === currentMemberId && allMembers.length > 1) {
+      logger.warn(`Selected member is the same as current member (${currentMemberId}), this might happen if only one member exists.`);
+      // ここで処理を中断するか、そのまま進めるか選択。今回はそのまま進めてみる。
+      // ユーザーにフィードバックを返すことも検討。
+      // await slackClient.chat.postEphemeral({ channel: channelId, user: userId, text: "他の担当者が見つかりませんでした。" });
+    }
+
 
     // --- 6. DynamoDBのデータを更新 ---
     await updateDynamoDBForReselection(currentMemberId, newMember);
