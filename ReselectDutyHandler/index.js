@@ -186,65 +186,77 @@ const createMemberListBlocks = (members) => {
   ];
 };
 
-// ★ 元のSlackメッセージを更新する関数
-const updateSlackMessage = async (channelId, messageTs, newMember, originalMemberId, reselectorUserId, members) => { // ★ originalMemberId も受け取る
-  const newMemberId = newMember.memberId;
-  const newMemberMention = newMemberId.startsWith('U') || newMemberId.startsWith('W') ? `<@${newMemberId}>` : (newMember.memberName || newMemberId);
-  const originalMemberMention = originalMemberId.startsWith('U') || originalMemberId.startsWith('W') ? `<@${originalMemberId}>` : originalMemberId; // 元の担当者も表示（任意）
+// ★ Slackメッセージ更新関数 (メッセージ形式を変更)
+const updateSlackMessage = async (channelId, messageTs, newMember, originalMemberId, reselectorUserId, members, currentState) => {
+  const newMemberId = newMember?.memberId || "不明";
+  const newMemberName = newMember?.memberName; // 名前も取得
+  const newMemberMention = newMemberId.startsWith('U') || newMemberId.startsWith('W') ? `<@${newMemberId}>` : (newMemberName || newMemberId);
   const reselectorMention = reselectorUserId ? `<@${reselectorUserId}>` : "誰か";
 
-  // メッセージ本文を更新
-  const text = `🔄 ${reselectorMention} さんが担当者を変更しました。\n新しい担当は ${newMemberMention} さんです！ (元の担当: ${originalMemberMention})`;
-  // ★ メンバーリスト表示用のブロックを作成
+  // ★ DutyState から assignmentDate を取得 ★
+  const todayDateStr = currentState?.assignmentDate || formatInTimeZone(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd'); // currentState がない場合のフォールバック
+
+  // ★ 変更後のメッセージ本文を定義 ★
+  // 1行目: 新しい担当者の通知 (最初の通知と同じ形式)
+  const mainMessage = `☀️ 今日 (${todayDateStr}) の日直は ${newMemberMention} さんです！\nよろしくお願いします！`;
+
+  // 2行目: 変更履歴 (Contextブロックに入れる)
+  const contextMessage = `:arrows_counterclockwise: ${reselectorMention} さんが担当者を変更しました。`;
+
+  // メンバーリスト表示用ブロック (変更なし)
   const memberListBlocks = createMemberListBlocks(members);
+
+  // フォールバックテキスト
+  const fallbackText = `現在の日直は ${newMemberMention} さんです。(変更者: ${reselectorMention})`;
 
   try {
     await slackClient.chat.update({
       channel: channelId,
       ts: messageTs,
-      text: text, // フォールバックテキストも更新
+      text: fallbackText, // フォールバックテキスト
       blocks: [
+        // ★ 1. 新担当者通知ブロック
         {
           "type": "section",
           "text": {
             "type": "mrkdwn",
-            "text": text // 更新されたメッセージ本文
+            "text": mainMessage
           }
         },
-        // { // コンテキスト情報として元の担当者などを表示しても良い (任意)
-        //     "type": "context",
-        //     "elements": [
-        //         { "type": "mrkdwn", "text": `元の担当: ${originalMemberMention}` }
-        //     ]
-        // },
-        { // ★ ボタンを含む actions ブロックを再度追加 (ボタンは消さない)
+        // ★ 2. ボタンブロック (変更なし)
+        {
           "type": "actions",
-          "block_id": "duty_actions", // 同じ block_id
+          "block_id": "duty_actions",
           "elements": [
             {
               "type": "button",
-              "text": {
-                "type": "plain_text",
-                "text": "担当を変更する", // ボタンのテキストは同じ
-                "emoji": true
-              },
+              "text": { "type": "plain_text", "text": "担当を変更する", "emoji": true },
               "style": "danger",
-              "action_id": "reselect_duty_action", // 同じ action_id
-              // ★★★ 重要: value には *新しい* 担当者のIDを入れる ★★★
+              "action_id": "reselect_duty_action",
               "value": JSON.stringify({ current_member_id: newMemberId })
             }
           ]
         },
-        // ★★★ 作成したメンバーリストブロックを追加 ★★★
+        // ★ 3. 変更履歴ブロック (Context)
+        {
+          "type": "context",
+          "elements": [
+            {
+              "type": "mrkdwn",
+              "text": contextMessage
+            }
+          ]
+        },
+        // ★ 4. メンバーリストブロック (divider + context) (変更なし)
         ...memberListBlocks
       ]
     });
-    logger.info(`Updated Slack message ${messageTs} with new duty member ${newMemberId}, keeping the button.`);
+    logger.info(`Updated Slack message ${messageTs} with new format.`);
   } catch (error) {
     logger.error(`Error updating Slack message ${messageTs}: ${error.data?.error || error.message}`);
-    // エラー処理はそのまま
   }
 };
+
 
 
 // --- Lambdaハンドラー ---
@@ -348,13 +360,13 @@ export const handler = async (event, context) => {
     if (!newMember) {
       logger.error(`Failed to get details for the newly selected member ${newMemberId}`);
       // エラー処理...（メッセージ更新は試みる）
-      await updateSlackMessage(channelId, messageTs, { memberId: newMemberId }, currentMemberIdFromButton, userId, updatedMembers); // IDだけでも渡す
+      await updateSlackMessage(channelId, messageTs, { memberId: newMemberId }, currentMemberIdFromButton, userId, updatedMembers, currentState); // IDだけでも渡す
       return { statusCode: 200, body: 'OK (Failed to get new member details)' };
     }
 
 
     // ★ Slackメッセージ更新
-    await updateSlackMessage(channelId, messageTs, newMember, currentMemberIdFromButton, userId, updatedMembers);
+    await updateSlackMessage(channelId, messageTs, newMember, currentMemberIdFromButton, userId, updatedMembers, currentState);
 
     logger.info("List rotation reselection process completed successfully.");
     return { statusCode: 200, body: 'OK (List rotation reselection processed)' };
