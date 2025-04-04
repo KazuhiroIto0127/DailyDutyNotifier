@@ -1,5 +1,5 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, ScanCommand, GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, ScanCommand, GetCommand, UpdateCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
 import { WebClient } from '@slack/web-api';
 import { createHmac } from 'crypto';
 import querystring from 'querystring'; // ★ ペイロード解析用
@@ -105,78 +105,53 @@ const verifySlackRequest = (event) => {
   }
 };
 
-// ★ 選出ロジックを「メンバーID順ローテーション」に変更 ★
-const selectNextMemberByIdRotation = (members, currentMemberId) => {
-  if (!members || members.length <= 1) {
-    logger.warn("Cannot select next member by ID rotation: Not enough members.");
-    return members.length === 1 ? members[0] : null;
+// ★ DB更新ロジック (カウント増減 + DutyState の Index と MemberId 更新)
+const updateDutyDataOnReselect = async (originalMemberId, newMemberId, newIndex, currentState) => {
+  // currentState から assignmentDate と rotationList を引き継ぐ
+  const assignmentDate = currentState.assignmentDate;
+  const rotationList = currentState.rotationList;
+
+  if (!assignmentDate || !rotationList || rotationList.length === 0) {
+    logger.error("Cannot update state on reselect: Missing assignmentDate or rotationList in current state.");
+    // ここでエラーにするか、部分的に更新するか選択。エラーにするのが安全か。
+    throw new Error("Invalid duty state for reselection.");
   }
 
-  // 1. ★★★ メンバーIDのみでソート (これが固定ローテーション順) ★★★
-  const sortedMembers = [...members].sort((a, b) => {
-    return (a.memberId || '').localeCompare(b.memberId || '');
-  });
-  logger.info(`[selectNextById] Sorted members by ID: ${sortedMembers.map(m => m.memberId).join(', ')}`);
-
-  // 2. ソート済みリスト内で、現在の担当者のインデックスを見つける
-  const currentIndex = sortedMembers.findIndex(m => m.memberId === currentMemberId);
-  logger.info(`[selectNextById] Current member ${currentMemberId} found at index: ${currentIndex}`);
-
-  if (currentIndex === -1) {
-    logger.error(`[selectNextById] Current member ${currentMemberId} not found in sorted list. Selecting the first member.`);
-    return sortedMembers[0];
-  }
-
-  // 3. 次のインデックスを計算 (リストの末尾なら先頭に戻る)
-  const nextIndex = (currentIndex + 1) % sortedMembers.length;
-  const newMember = sortedMembers[nextIndex];
-  logger.info(`[selectNextById] Next member selected based on ID rotation: ${newMember.memberId} (Index: ${nextIndex})`);
-  return newMember;
-};
-
-// ★ 再選出時のDynamoDB更新ロジック
-const updateDynamoDBForReselection = async (originalMemberId, newMember) => {
-  const newMemberId = newMember.memberId;
   try {
-    // 1. 元の担当者のカウントをデクリメント (-1)
-    //    注意: カウントが0未満にならないような制御はここでは省略（必要ならConditionExpression追加）
+    // 1. 元の担当者のカウントを-1
     const decrementCommand = new UpdateCommand({
-      TableName: membersTableName,
-      Key: { memberId: originalMemberId },
-      UpdateExpression: "ADD dutyCount :dec",
-      ExpressionAttributeValues: { ':dec': -1 },
+      TableName: membersTableName, Key: { memberId: originalMemberId },
+      UpdateExpression: "ADD dutyCount :dec", ExpressionAttributeValues: { ':dec': -1 },
       ReturnValues: "UPDATED_NEW",
     });
     const decResult = await docClient.send(decrementCommand);
-    logger.info(`Decremented duty count for original member ${originalMemberId}. New count: ${decResult.Attributes?.dutyCount}`);
+    logger.info(`Decremented count for ${originalMemberId}. New: ${decResult.Attributes?.dutyCount}`);
 
-    // 2. 新しい担当者のカウントをインクリメント (+1)
+    // 2. 新しい担当者のカウントを+1
     const incrementCommand = new UpdateCommand({
-      TableName: membersTableName,
-      Key: { memberId: newMemberId },
-      UpdateExpression: "ADD dutyCount :inc",
-      ExpressionAttributeValues: { ':inc': 1 },
+      TableName: membersTableName, Key: { memberId: newMemberId },
+      UpdateExpression: "ADD dutyCount :inc", ExpressionAttributeValues: { ':inc': 1 },
       ReturnValues: "UPDATED_NEW",
     });
     const incResult = await docClient.send(incrementCommand);
-    logger.info(`Incremented duty count for new member ${newMemberId}. New count: ${incResult.Attributes?.dutyCount}`);
+    logger.info(`Incremented count for ${newMemberId}. New: ${incResult.Attributes?.dutyCount}`);
 
-    // 3. DutyState の lastAssignedMemberId を新しい担当者で更新
-    //    lastAssignmentDate は元の通知日のままにする想定
-    const updateStateCommand = new UpdateCommand({
+    // 3. DutyState テーブルを更新 (PutCommandで必須項目含めて上書き)
+    const putStateCommand = new PutCommand({
       TableName: stateTableName,
-      Key: { stateId: stateId },
-      UpdateExpression: "SET lastAssignedMemberId = :new_id",
-      ExpressionAttributeValues: { ':new_id': newMemberId },
-      // ConditionExpression: "lastAssignedMemberId = :original_id", // 必要なら現在の値を確認
-      // ExpressionAttributeValues: { ':new_id': newMemberId, ':original_id': originalMemberId },
+      Item: {
+        stateId: stateId,
+        assignmentDate: assignmentDate, // 日付は維持
+        rotationList: rotationList,     // リストも維持
+        currentListIndex: newIndex,     // ★ 新しいインデックス
+        currentAssignedMemberId: newMemberId, // ★ 新しい担当者ID
+      },
     });
-    await docClient.send(updateStateCommand);
-    logger.info(`Updated duty state lastAssignedMemberId to ${newMemberId}`);
+    await docClient.send(putStateCommand);
+    logger.info(`Updated duty state: New index ${newIndex}, New member ${newMemberId}`);
 
   } catch (error) {
-    logger.error(`Error updating DynamoDB during reselection: ${error}`);
-    // ConditionalCheckFailedException などもここで捕捉される
+    logger.error(`Error updating data on reselect (original: ${originalMemberId}, new: ${newMemberId}): ${error}`);
     throw error;
   }
 };
@@ -314,63 +289,75 @@ export const handler = async (event, context) => {
 
     // --- 3. 必要な情報をペイロードから抽出 ---
     const buttonValue = JSON.parse(action.value || '{}');
-    const currentMemberId = buttonValue.current_member_id; // ボタンのvalueに埋め込んだ元の担当者ID
+    const currentMemberIdFromButton = buttonValue.current_member_id; // ボタンに紐づいた担当者
     const channelId = payload.container?.channel_id;
     const messageTs = payload.container?.message_ts; // 元のメッセージのタイムスタンプ
     const userId = payload.user?.id; // ボタンを押したユーザーのID
 
-    if (!currentMemberId || !channelId || !messageTs) {
+    if (!currentMemberIdFromButton || !channelId || !messageTs) {
       logger.error("Missing required info (current_member_id, channel_id, message_ts) in payload.");
       // エラーをユーザーに伝えるのは難しいのでログに残す
       return { statusCode: 200, body: 'OK (Missing info in payload)' }; // SlackにはACKを返す
     }
-    logger.info(`Reselection requested for current member ${currentMemberId} in channel ${channelId}, message ${messageTs} by user ${userId}`);
+    logger.info(`Reselection requested for current member ${currentMemberIdFromButton} in channel ${channelId}, message ${messageTs} by user ${userId}`);
 
     // --- ここからが実際の再選出処理 ---
     // Slackは3秒以内にACK応答を期待するため、重い処理は非同期化推奨だが、
     // 今回は同期的に処理してみる
 
     // --- 再選出処理 ---
-    // ★★★ getAllMembers のみ呼び出す ★★★
-    const allMembers = await getAllMembers();
-
-    if (allMembers.length === 0) {
-      logger.error("No members found in DynamoDB.");
-      // 元のメッセージを更新してエラーを伝える
-      await slackClient.chat.update({ channel: channelId, ts: messageTs, text: "エラー: メンバー情報が見つかりません。", blocks: [] });
-      return { statusCode: 200, body: 'OK (Member fetch error)' };
+    // ★★★ DutyState からローテーションリストと現在のインデックスを取得 ★★★
+    const currentState = await getDutyState();
+    const rotationList = currentState.rotationList;
+    const currentListIndex = currentState.currentListIndex;
+    // 念のため、ボタンのIDとStateのIDが一致するか確認 (通常は一致するはず)
+    if (currentState.currentAssignedMemberId !== currentMemberIdFromButton) {
+      logger.warn(`Button member ID (${currentMemberIdFromButton}) does not match current state member ID (${currentState.currentAssignedMemberId}). Proceeding based on button value.`);
+      // ボタンの値を正として進めるか、エラーにするか選択。ここではボタンの値で進める。
     }
 
-    // --- 5. 新しい日直を選出 ---
-    const newMember = selectNextMemberByIdRotation(allMembers, currentMemberId);
+
+    if (!rotationList || rotationList.length === 0 || currentListIndex === undefined || currentListIndex < 0) {
+      logger.error("Invalid rotation data in DutyState. Cannot proceed with reselection.");
+      await slackClient.chat.postEphemeral({ channel: channelId, user: userId, text: "エラー: ローテーション情報が見つからないため、担当者を変更できません。" });
+      return { statusCode: 200, body: 'OK (Invalid rotation state)' };
+    }
+    if (rotationList.length <= 1) {
+      logger.warn("Only one member in rotation list. Cannot reselect.");
+      await slackClient.chat.postEphemeral({ channel: channelId, user: userId, text: "交代できる他の担当がいません。" });
+      return { statusCode: 200, body: 'OK (Only one member)' };
+    }
+
+
+    // ★ 次の担当者のインデックスとIDを決定
+    const nextIndex = (currentListIndex + 1) % rotationList.length;
+    const newMemberId = rotationList[nextIndex];
+    logger.info(`Next member determined from rotation list: Index ${nextIndex}, ID ${newMemberId}`);
+
+    // ★ DynamoDB更新 (カウント増減 + StateのIndex/MemberId更新)
+    await updateDutyDataOnReselect(currentMemberIdFromButton, newMemberId, nextIndex, currentState);
+
+    // ★ Slackメッセージ更新用の情報を取得
+    //   最新のメンバー情報(カウント反映後)と、新しい担当者の詳細情報が必要
+    const [updatedMembers, newMemberDetailsList] = await Promise.all([
+      getAllMembers(), // 最新の全メンバーリスト(表示用)
+      docClient.send(new GetCommand({ TableName: membersTableName, Key: { memberId: newMemberId } })) // 新担当者の詳細取得
+    ]);
+    const newMember = newMemberDetailsList.Item; // 新担当者のオブジェクト
 
     if (!newMember) {
-      logger.error("Failed to select a new member (no candidates?).");
-      await slackClient.chat.update({ channel: channelId, ts: messageTs, text: "エラー: 代わりの担当者を選出できませんでした。", blocks: [] });
-      return { statusCode: 200, body: 'OK (Reselection failed)' };
-    }
-    // ★ もし newMember が currentMemberId と同じになってしまった場合のガード (メンバー1人の場合など)
-    if (newMember.memberId === currentMemberId && allMembers.length > 1) {
-      logger.warn(`Selected member is the same as current member (${currentMemberId}), this might happen if only one member exists.`);
-      // ここで処理を中断するか、そのまま進めるか選択。今回はそのまま進めてみる。
-      // ユーザーにフィードバックを返すことも検討。
-      // await slackClient.chat.postEphemeral({ channel: channelId, user: userId, text: "他の担当者が見つかりませんでした。" });
+      logger.error(`Failed to get details for the newly selected member ${newMemberId}`);
+      // エラー処理...（メッセージ更新は試みる）
+      await updateSlackMessage(channelId, messageTs, { memberId: newMemberId }, currentMemberIdFromButton, userId, updatedMembers); // IDだけでも渡す
+      return { statusCode: 200, body: 'OK (Failed to get new member details)' };
     }
 
 
-    // --- 6. DynamoDBのデータを更新 ---
-    await updateDynamoDBForReselection(currentMemberId, newMember);
+    // ★ Slackメッセージ更新
+    await updateSlackMessage(channelId, messageTs, newMember, currentMemberIdFromButton, userId, updatedMembers);
 
-    // ★★★ Slack更新前に最新のメンバー情報を再取得 ★★★
-    const updatedMembers = await getAllMembers();
-
-    // --- 7. 元のSlackメッセージを更新 ---
-    await updateSlackMessage(channelId, messageTs, newMember, currentMemberId, userId, updatedMembers);
-
-
-    // --- 8. 正常終了のACK応答 ---
-    logger.info("Reselection process completed successfully.");
-    return { statusCode: 200, body: 'OK (Reselection processed)' };
+    logger.info("List rotation reselection process completed successfully.");
+    return { statusCode: 200, body: 'OK (List rotation reselection processed)' };
 
   } catch (error) {
     logger.error(`Error handling Slack interaction: ${error.message}`);

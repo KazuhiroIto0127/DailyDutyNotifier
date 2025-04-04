@@ -74,70 +74,6 @@ const getAllMembers = async () => {
   }
 };
 
-// 次の日直を選出するロジック
-const selectNextDutyMember = (members, lastAssignedId) => {
-  if (!members || members.length === 0) {
-    logger.error("Member list is empty, cannot select duty member.");
-    return null;
-  }
-
-  // 1. 前回の担当者を除外した候補者リストを作成
-  let candidates = members.filter(m => m.memberId !== lastAssignedId);
-
-  // 2. 候補者がいなくなったら、全員を候補者に戻す（例：メンバーが1人しかいない場合など）
-  if (candidates.length === 0) {
-    logger.warn("No candidates after excluding the last assigned member. Considering all members.");
-    candidates = [...members]; // 元の配列を壊さないようにコピー
-  }
-
-  // 3. 候補者をソート: dutyCount昇順 -> memberId昇順
-  candidates.sort((a, b) => {
-    if (a.dutyCount !== b.dutyCount) {
-      return a.dutyCount - b.dutyCount;
-    }
-    // memberIdが未定義の場合も考慮（通常はないはず）
-    return (a.memberId || '').localeCompare(b.memberId || '');
-  });
-
-  // 4. ソート後の最初のメンバーを選出
-  const selectedMember = candidates[0];
-  logger.info(`Selected duty member: ${selectedMember.memberId} (Count: ${selectedMember.dutyCount})`);
-  return selectedMember;
-};
-
-// DynamoDBのデータを更新する (カウントアップと状態更新)
-const updateDutyData = async (selectedMember, todayStr) => {
-  const memberId = selectedMember.memberId;
-  try {
-    // 1. DutyMembersテーブルのdutyCountをインクリメント
-    const updateMemberCommand = new UpdateCommand({
-      TableName: membersTableName,
-      Key: { memberId: memberId },
-      UpdateExpression: "ADD dutyCount :inc",
-      ExpressionAttributeValues: { ':inc': 1 },
-      ReturnValues: "UPDATED_NEW", // 更新後の値を取得（ログ用）
-    });
-    const updateResult = await docClient.send(updateMemberCommand);
-    logger.info(`Incremented duty count for ${memberId}. New count: ${updateResult.Attributes?.dutyCount}`);
-
-    // 2. DutyStateテーブルを更新
-    const putStateCommand = new PutCommand({
-      TableName: stateTableName,
-      Item: {
-        stateId: stateId,
-        lastAssignedMemberId: memberId,
-        lastAssignmentDate: todayStr,
-      },
-    });
-    await docClient.send(putStateCommand);
-    logger.info(`Updated duty state: lastAssignedMemberId=${memberId}, lastAssignmentDate=${todayStr}`);
-
-  } catch (error) {
-    logger.error(`Error updating DynamoDB for member ${memberId}: ${error}`);
-    throw error;
-  }
-};
-
 // ★ メンバーリスト表示用ブロック作成 (displayOrder でソート)
 const createMemberListBlocks = (members) => {
   if (!members || members.length === 0) return [];
@@ -167,6 +103,107 @@ const createMemberListBlocks = (members) => {
     }
   ];
 };
+
+// ★ 最初の担当者を選出するロジック (変更なし)
+const selectFirstDutyMember = (members, lastAssignmentState) => {
+  // lastAssignmentState から前日の担当者IDを取得 (もしあれば)
+  const yesterdayAssignedId = lastAssignmentState?.assignmentDate && lastAssignmentState.assignmentDate !== formatInTimeZone(new Date(), timeZone, 'yyyy-MM-dd') // 日付が変わっていたら考慮しない方が安全かも？要件次第
+    ? lastAssignmentState.currentAssignedMemberId
+    : null; // 前日のデータがない or 日付が同じなら考慮しない
+
+  logger.info(`Selecting first member, excluding yesterday's: ${yesterdayAssignedId}`);
+  let candidates = members.filter(m => m.memberId !== yesterdayAssignedId);
+
+  if (candidates.length === 0) {
+    logger.warn("No candidates after excluding yesterday's member. Considering all members.");
+    candidates = [...members];
+  }
+
+  // カウント昇順 -> 表示順昇順でソート (従来通り)
+  candidates.sort((a, b) => {
+    const countA = a.dutyCount || 0; const countB = b.dutyCount || 0;
+    if (countA !== countB) return countA - countB;
+    const orderA = a.displayOrder ?? Infinity; const orderB = b.displayOrder ?? Infinity;
+    if (orderA !== orderB) return orderA - orderB;
+    return (a.memberId || '').localeCompare(b.memberId || '');
+  });
+  logger.info(`First member candidates sorted: ${candidates.map(m => m.memberId).join(', ')}`);
+
+  return candidates[0]; // 最初の候補者
+};
+
+// ★ ローテーションリストを作成する関数
+const createRotationList = (members) => {
+  // カウント昇順 -> 表示順昇順でソート
+  const sortedMembers = [...members].sort((a, b) => {
+    const countA = a.dutyCount || 0; const countB = b.dutyCount || 0;
+    if (countA !== countB) return countA - countB;
+    const orderA = a.displayOrder ?? Infinity; const orderB = b.displayOrder ?? Infinity;
+    if (orderA !== orderB) return orderA - orderB;
+    return (a.memberId || '').localeCompare(b.memberId || '');
+  });
+  // メンバーIDの配列を返す
+  const rotationList = sortedMembers.map(m => m.memberId);
+  logger.info(`Generated rotation list: ${rotationList.join(', ')}`);
+  return rotationList;
+};
+
+// ★ DynamoDB更新ロジック (カウント+1 と DutyState更新)
+const updateInitialDutyData = async (selectedMember, rotationList, todayStr) => {
+  const memberId = selectedMember.memberId;
+  const currentIndex = rotationList.indexOf(memberId); // rotationList 内でのインデックス
+
+  if (currentIndex === -1) {
+    logger.error(`Selected member ${memberId} not found in generated rotation list! Aborting state update.`);
+    // カウントアップだけ実行するか、全体をエラーにするか選択
+    // ここではカウントアップは実行し、State更新はスキップする
+    try {
+      const updateMemberCommand = new UpdateCommand({
+        TableName: membersTableName,
+        Key: { memberId: memberId },
+        UpdateExpression: "ADD dutyCount :inc",
+        ExpressionAttributeValues: { ':inc': 1 },
+        ReturnValues: "UPDATED_NEW", // 更新後の値を取得（ログ用）
+      });
+      await docClient.send(updateMemberCommand);
+      logger.info(`Incremented duty count for ${memberId} but state update skipped.`);
+    } catch (error) {
+      logger.error(`Error incrementing count for ${memberId}: ${error}`);
+      throw error; // カウントアップも失敗したらエラー
+    }
+    return; // State更新は行わない
+  }
+
+  try {
+    // 1. 担当者のカウントを+1
+    const updateMemberCommand = new UpdateCommand({
+      TableName: membersTableName, Key: { memberId: memberId },
+      UpdateExpression: "ADD dutyCount :inc", ExpressionAttributeValues: { ':inc': 1 },
+      ReturnValues: "UPDATED_NEW",
+    });
+    const updateResult = await docClient.send(updateMemberCommand);
+    logger.info(`Incremented duty count for ${memberId}. New count: ${updateResult.Attributes?.dutyCount}`);
+
+    // 2. DutyStateテーブルを更新 (PutCommandで上書き)
+    const putStateCommand = new PutCommand({
+      TableName: stateTableName,
+      Item: {
+        stateId: stateId,
+        assignmentDate: todayStr,         // ★ 今日の日付
+        rotationList: rotationList,       // ★ 今日のローテーションリスト
+        currentListIndex: currentIndex,   // ★ 現在の担当者のインデックス
+        currentAssignedMemberId: memberId, // ★ 現在の担当者ID
+      },
+    });
+    await docClient.send(putStateCommand);
+    logger.info(`Updated duty state for ${todayStr} with rotation list. Current index: ${currentIndex}, Member: ${memberId}`);
+
+  } catch (error) {
+    logger.error(`Error updating initial duty data for ${memberId}: ${error}`);
+    throw error;
+  }
+};
+
 
 // Slackに日直通知を送信 (ボタン付き)
 const sendSlackNotification = async (member, dateStr, members) => {
@@ -237,32 +274,33 @@ export const handler = async (event, context) => {
   logger.info(`Today is ${todayStr} in ${timeZone}, a weekday. Proceeding...`);
 
   try {
-    // --- 2. 必要なデータをDynamoDBから取得 ---
-    const [dutyState, allMembers] = await Promise.all([
-      getDutyState(),
+    // ★ 前日の状態取得と現在のメンバーリスト取得
+    const [lastAssignmentState, currentMembers] = await Promise.all([
+      getDutyState(), // ★ 名前変更: getDutyState はそのまま
       getAllMembers()
     ]);
 
-    if (allMembers.length === 0) {
+    if (currentMembers.length === 0) {
       logger.warn("No members found in DynamoDB. Cannot assign duty.");
       // 必要であればSlackにエラー通知
       await slackClient.chat.postMessage({ channel: slackChannelId, text: "日直担当者を選出できませんでした: メンバーが登録されていません。" });
       return { statusCode: 400, body: 'No members found' };
     }
 
-    // --- 3. 次の日直を選出 ---
-    const lastAssignedId = dutyState.lastAssignedMemberId;
-    logger.info(`Last assigned member ID: ${lastAssignedId}`);
-    const selectedMember = selectNextDutyMember(allMembers, lastAssignedId);
-
+    // ★ 最初の担当者を選出
+    const selectedMember = selectFirstDutyMember(currentMembers, lastAssignmentState);
     if (!selectedMember) {
       logger.error("Failed to select a duty member.");
       await slackClient.chat.postMessage({ channel: slackChannelId, text: "日直担当者を選出できませんでした: 候補者が見つかりません。" });
       return { statusCode: 500, body: 'Failed to select member' };
     }
+    logger.info(`First duty member selected: ${selectedMember.memberId}`);
 
-    // --- 4. DynamoDBのデータを更新 ---
-    await updateDutyData(selectedMember, todayStr);
+    // ★ 今日のローテーションリストを作成
+    const rotationList = createRotationList(currentMembers);
+
+    // ★ DynamoDB更新 (カウント+1 と DutyState更新)
+    await updateInitialDutyData(selectedMember, rotationList, todayStr);
 
     // ★★★ Slack通知前に最新のメンバー情報を再取得 ★★★
     const updatedMembers = await getAllMembers();
