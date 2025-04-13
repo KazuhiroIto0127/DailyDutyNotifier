@@ -27,12 +27,14 @@ const slackClient = new WebClient(slackToken);
 
 // --- ヘルパー関数 ---
 const isWeekdayInZone = (date, tz) => {
-  // 1. 指定タイムゾーンでの曜日を取得 (0=日曜, 6=土曜)
+  // 1. 指定タイムゾーンでの曜日を取得 (1=月曜, ..., 7=日曜 - ISO 8601)
   // formatInTimeZone を使って曜日番号('i')を取得し数値に変換
   const dayOfWeek = parseInt(formatInTimeZone(date, tz, 'i'), 10);
-  if (dayOfWeek === 0 || dayOfWeek === 6) {
-    logger.info(`Detected weekend (Day: ${dayOfWeek}) in ${tz}`);
-    return false;
+  logger.info(`[isWeekdayInZone] Checking date: ${formatInTimeZone(date, tz, 'yyyy-MM-dd HH:mm:ssXXX')}, ISO DayOfWeek (1-7): ${dayOfWeek}`);
+  // 土曜(6) または 日曜(7) かどうかをチェック
+  if (dayOfWeek === 6 || dayOfWeek === 7) {
+    logger.info(`Detected weekend (ISO Day: ${dayOfWeek}) in ${tz}. Skipping.`);
+    return false; // 土日なら false を返す
   }
 
   // 2. 日本の祝日かどうかチェック (@holiday-jp/holiday_jp は Date オブジェクトを渡せばOK)
